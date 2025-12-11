@@ -7,7 +7,7 @@ from torchvision.ops.misc import FrozenBatchNorm2d
 
 import transforms
 from my_dataset_coco import CocoDetection
-from my_dataset_voc import VOCInstances
+
 from backbone import resnet50_fpn_backbone
 from network_files import MaskRCNN
 import train_utils.train_eval_utils as utils
@@ -86,14 +86,28 @@ def main(args):
         train_batch_sampler = torch.utils.data.BatchSampler(
             train_sampler, args.batch_size, drop_last=True)
 
-    data_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_sampler=train_batch_sampler, num_workers=args.workers,
-        collate_fn=train_dataset.collate_fn)
+    # 修复：当workers=0时，不能设置timeout参数
+    if args.workers > 0:
+        data_loader = torch.utils.data.DataLoader(
+            train_dataset, batch_sampler=train_batch_sampler, num_workers=args.workers,
+            timeout=30 if args.distributed else 0,
+            collate_fn=train_dataset.collate_fn)
+    else:
+        data_loader = torch.utils.data.DataLoader(
+            train_dataset, batch_sampler=train_batch_sampler, num_workers=args.workers,
+            collate_fn=train_dataset.collate_fn)
 
-    data_loader_test = torch.utils.data.DataLoader(
-        val_dataset, batch_size=1,
-        sampler=test_sampler, num_workers=args.workers,
-        collate_fn=train_dataset.collate_fn)
+    if args.workers > 0:
+        data_loader_test = torch.utils.data.DataLoader(
+            val_dataset, batch_size=1,
+            sampler=test_sampler, num_workers=args.workers,
+            timeout=30 if args.distributed else 0,
+            collate_fn=train_dataset.collate_fn)
+    else:
+        data_loader_test = torch.utils.data.DataLoader(
+            val_dataset, batch_size=1,
+            sampler=test_sampler, num_workers=args.workers,
+            collate_fn=train_dataset.collate_fn)
 
     print("Creating model")
     # create model num_classes equal background + classes
@@ -105,7 +119,8 @@ def main(args):
 
     model_without_ddp = model
     if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+        # 添加find_unused_parameters参数防止某些层不参与梯度计算导致卡住
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
         model_without_ddp = model.module
 
     params = [p for p in model.parameters() if p.requires_grad]
@@ -207,7 +222,7 @@ if __name__ == "__main__":
         description=__doc__)
 
     # 训练文件的根目录(coco2017)
-    parser.add_argument('--data-path', default='/data/coco2017', help='dataset')
+    parser.add_argument('--data-path', default='/group/chenjinming/wyy/pytorch-pilipala-coco2017/coco2017—guanwang', help='dataset')
     # 训练设备类型
     parser.add_argument('--device', default='cuda', help='device')
     # 检测目标类别数(不包含背景)
@@ -235,14 +250,14 @@ if __name__ == "__main__":
                         metavar='W', help='weight decay (default: 1e-4)',
                         dest='weight_decay')
     # 针对torch.optim.lr_scheduler.StepLR的参数
-    parser.add_argument('--lr-step-size', default=8, type=int, help='decrease lr every step-size epochs')
+    parser.add_argument('--lr-step_size', default=8, type=int, help='decrease lr every step-size epochs')
     # 针对torch.optim.lr_scheduler.MultiStepLR的参数
     parser.add_argument('--lr-steps', default=[16, 22], nargs='+', type=int,
                         help='decrease lr every step-size epochs')
     # 针对torch.optim.lr_scheduler.MultiStepLR的参数
     parser.add_argument('--lr-gamma', default=0.1, type=float, help='decrease lr by a factor of lr-gamma')
     # 训练过程打印信息的频率
-    parser.add_argument('--print-freq', default=30, type=int, help='print frequency')
+    parser.add_argument('--print-freq', default=50, type=int, help='print frequency')
     # 文件保存地址
     parser.add_argument('--output-dir', default='multi_train', help='path where to save')
     # 基于上次的训练结果接着训练

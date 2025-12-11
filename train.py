@@ -43,7 +43,7 @@ def create_model(num_classes, load_pretrain_weights=True):
     # 如果没有权重，传 "" 空字符串即可
     backbone = legnet_fpn_backbone(pretrain_path="LWEGNet_tiny.pth") 
     
-    model = MaskRCNN(backbone, num_classes=num_classes)
+    model = MaskRCNN(backbone, num_classes=num_classes, min_size=1000, max_size=1333) #复写了min_size=1000, max_size=1333 
 
     if load_pretrain_weights:
         # 注意：如果你换了 backbone，原来的 'maskrcnn_resnet50_fpn_coco.pth' 
@@ -110,13 +110,18 @@ def main(args):
         f.write(seg_header)
         f.write("# 数据开始:\n")
 
+    # 在 train.py 中修改 data_transform
     data_transform = {
-        "train": transforms.Compose([transforms.ToTensor(),
-                                     transforms.RandomHorizontalFlip(0.5),
-                                     transforms.RandomVerticalFlip(0.5)]),
+        "train": transforms.Compose([
+            transforms.ToTensor(),
+            transforms.RandomHorizontalFlip(0.5),
+            transforms.RandomVerticalFlip(0.5),
+            # [新增] 在这里加入新的增强
+            transforms.RandomColorJitter(brightness=0.3, contrast=0.3, prob=0.5), 
+            transforms.RandomGaussianBlur(prob=0.3)
+        ]),
         "val": transforms.Compose([transforms.ToTensor()])
     }
-
     data_root = args.data_path
 
     # load train data set

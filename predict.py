@@ -20,6 +20,7 @@ def create_model(num_classes, box_thresh=0.5):
     
     model = MaskRCNN(backbone,
                      num_classes=num_classes,
+                     min_size=1000, max_size=1333, # 尝试增大输入分辨率
                      rpn_score_thresh=box_thresh,
                      box_score_thresh=box_thresh)
 
