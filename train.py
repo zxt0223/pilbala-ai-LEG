@@ -3,7 +3,7 @@ import datetime
 
 import torch
 from torchvision.ops.misc import FrozenBatchNorm2d
-
+from torch.utils.tensorboard import SummaryWriter
 import transforms
 from network_files import MaskRCNN
 # from backbone import resnet50_fpn_backbone    # 原有的
@@ -54,6 +54,7 @@ def create_model(num_classes, load_pretrain_weights=True):
 
     return model
 #-------------------------------------------------------------------------------↓修改后的
+
 def main(args):
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     print("Using {} device training.".format(device.type))
@@ -62,6 +63,52 @@ def main(args):
     now = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     det_results_file = f"det_results{now}.txt"
     seg_results_file = f"seg_results{now}.txt"
+
+    # 写入表头说明（编码格式：utf-8）
+    det_header = """# 目标检测(bounding box)评估结果文件
+# 每行格式: epoch:epoch_number bbox_AP50_95 bbox_AP50 bbox_AP75 bbox_AP_small bbox_AP_medium bbox_AP_large bbox_AR_1 bbox_AR_10 bbox_AR_100 loss learning_rate
+# 列说明:
+# 1. epoch: 训练轮次
+# 2. bbox_AP50_95: COCO主要评估指标，IoU阈值从0.5到0.95的平均mAP
+# 3. bbox_AP50: IoU阈值为0.5时的mAP（宽松指标）
+# 4. bbox_AP75: IoU阈值为0.75时的mAP（严格指标）
+# 5. bbox_AP_small: 小目标（面积<32²）的mAP
+# 6. bbox_AP_medium: 中目标（32²<面积<96²）的mAP
+# 7. bbox_AP_large: 大目标（面积>96²）的mAP
+# 8. bbox_AR_1: 每张图最多检测1个目标时的平均召回率
+# 9. bbox_AR_10: 每张图最多检测10个目标时的平均召回率
+# 10. bbox_AR_100: 每张图最多检测100个目标时的平均召回率
+# 11. loss: 当前epoch的平均训练损失
+# 12. learning_rate: 当前学习率
+#
+# 训练开始时间: {}\n""".format(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+    seg_header = """# 实例分割(segmentation mask)评估结果文件
+# 每行格式: epoch:epoch_number seg_AP50_95 seg_AP50 seg_AP75 seg_AP_small seg_AP_medium seg_AP_large seg_AR_1 seg_AR_10 seg_AR_100 loss learning_rate
+# 列说明:
+# 1. epoch: 训练轮次
+# 2. seg_AP50_95: 分割主要评估指标，IoU阈值从0.5到0.95的平均mAP
+# 3. seg_AP50: IoU阈值为0.5时的分割mAP
+# 4. seg_AP75: IoU阈值为0.75时的分割mAP
+# 5. seg_AP_small: 小目标分割mAP
+# 6. seg_AP_medium: 中目标分割mAP
+# 7. seg_AP_large: 大目标分割mAP
+# 8. seg_AR_1: 每张图最多检测1个目标时的分割召回率
+# 9. seg_AR_10: 每张图最多检测10个目标时的分割召回率
+# 10. seg_AR_100: 每张图最多检测100个目标时的分割召回率
+# 11. loss: 当前epoch的平均训练损失
+# 12. learning_rate: 当前学习率
+#
+# 训练开始时间: {}\n""".format(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+    # 写入表头到文件（使用utf-8编码）
+    with open(det_results_file, "w", encoding="utf-8") as f:
+        f.write(det_header)
+        f.write("# 数据开始:\n")
+    
+    with open(seg_results_file, "w", encoding="utf-8") as f:
+        f.write(seg_header)
+        f.write("# 数据开始:\n")
 
     data_transform = {
         "train": transforms.Compose([transforms.ToTensor(),
@@ -161,22 +208,32 @@ def main(args):
                                               warmup=True, scaler=scaler)
         train_loss.append(mean_loss.item())
         learning_rate.append(lr)
+        # [新增] 写入 Loss 和 学习率
+        writer.add_scalar('Loss/train', mean_loss.item(), epoch)
+        writer.add_scalar('Learning_Rate', lr, epoch)
 
         # update the learning rate
         lr_scheduler.step()
 
         # evaluate on the test dataset
         det_info, seg_info = utils.evaluate(model, val_data_loader, device=device)
+        # [新增] 写入 mAP (det_info[0] 是 mAP@0.5:0.95, det_info[1] 是 mAP@0.5)
+        writer.add_scalar('mAP_bbox/0.5:0.95', det_info[0], epoch)
+        writer.add_scalar('mAP_bbox/0.5', det_info[1], epoch)
+        # 如果有分割结果
+        if seg_info is not None:
+            writer.add_scalar('mAP_segm/0.5:0.95', seg_info[0], epoch)
+            writer.add_scalar('mAP_segm/0.5', seg_info[1], epoch)
 
-        # write detection into txt
-        with open(det_results_file, "a") as f:
+        # write detection into txt（追加模式，使用utf-8编码）
+        with open(det_results_file, "a", encoding="utf-8") as f:
             # 写入的数据包括coco指标还有loss和learning rate
             result_info = [f"{i:.4f}" for i in det_info + [mean_loss.item()]] + [f"{lr:.6f}"]
             txt = "epoch:{} {}".format(epoch, '  '.join(result_info))
             f.write(txt + "\n")
 
-        # write seg into txt
-        with open(seg_results_file, "a") as f:
+        # write seg into txt（追加模式，使用utf-8编码）
+        with open(seg_results_file, "a", encoding="utf-8") as f:
             # 写入的数据包括coco指标还有loss和learning rate
             result_info = [f"{i:.4f}" for i in seg_info + [mean_loss.item()]] + [f"{lr:.6f}"]
             txt = "epoch:{} {}".format(epoch, '  '.join(result_info))
@@ -193,6 +250,19 @@ def main(args):
         if args.amp:
             save_files["scaler"] = scaler.state_dict()
         torch.save(save_files, "save_weights/model_{}.pth".format(epoch))
+    # 循环结束后关闭
+    writer.close()
+    # 在文件末尾添加训练总结
+    with open(det_results_file, "a", encoding="utf-8") as f:
+        f.write(f"\n# 训练结束时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"# 总训练轮次: {args.epochs}\n")
+        if len(val_map) > 0:
+            best_epoch = val_map.index(max(val_map))
+            f.write(f"# 最佳bbox mAP@0.5:0.95: {max(val_map):.4f} (epoch {best_epoch})\n")
+    
+    with open(seg_results_file, "a", encoding="utf-8") as f:
+        f.write(f"\n# 训练结束时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"# 总训练轮次: {args.epochs}\n")
 
     # plot loss and lr curve
     if len(train_loss) != 0 and len(learning_rate) != 0:
@@ -206,6 +276,8 @@ def main(args):
 
 
 if __name__ == "__main__":
+    # 实例化 SummaryWriter
+    writer = SummaryWriter(log_dir='logs')
     import argparse
 
     parser = argparse.ArgumentParser(

@@ -9,12 +9,16 @@ import torch
 from torchvision import transforms
 
 from network_files import MaskRCNN
-from backbone import resnet50_fpn_backbone
+# [修改 1] 导入 LEGNet backbone，而不是 resnet50
+from backbone.legnet import legnet_fpn_backbone 
 from draw_box_utils import draw_objs
 
-
 def create_model(num_classes, box_thresh=0.5):
-    backbone = resnet50_fpn_backbone()
+    # [修改 2] 使用 legnet_fpn_backbone 构建网络
+    # 注意：预测时不需要加载 backbone 的预训练权重(pretrain_path="")，
+    # 因为稍后我们会加载整个模型(model_xx.pth)的权重。
+    backbone = legnet_fpn_backbone(pretrain_path="")
+    
     model = MaskRCNN(backbone,
                      num_classes=num_classes,
                      rpn_score_thresh=box_thresh,
@@ -22,18 +26,17 @@ def create_model(num_classes, box_thresh=0.5):
 
     return model
 
-
 def time_synchronized():
     torch.cuda.synchronize() if torch.cuda.is_available() else None
     return time.time()
 
-
 def main():
     num_classes = 1  # 不包含背景
     box_thresh = 0.5
-    weights_path = "save_weights\model_17.pth"
-    img_path = "test_image\image_20250725175332.jpg"
-    label_json_path = 'coco91_indices.json'     #自动会创建stone
+    # 请确保这里的权重路径是你用 LEGNet 训练出来的 model_xx.pth
+    weights_path = "save_weights/model_49.pth" 
+    img_path = "test_image/image_20250725175332.jpg" # 替换为你的测试图片路径
+    label_json_path = 'coco91_indices.json'
 
     # get devices
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -80,7 +83,7 @@ def main():
         predict_classes = predictions["labels"].to("cpu").numpy()
         predict_scores = predictions["scores"].to("cpu").numpy()
         predict_mask = predictions["masks"].to("cpu").numpy()
-        predict_mask = np.squeeze(predict_mask, axis=1)  # [batch, 1, h, w] -> [batch, h, w]
+        predict_mask = np.squeeze(predict_mask, axis=1)
 
         if len(predict_boxes) == 0:
             print("没有检测到任何目标!")
@@ -97,10 +100,7 @@ def main():
                              font_size=20)
         plt.imshow(plot_img)
         plt.show()
-        # 保存预测的图片结果
-        plot_img.save("test_result/test_result.jpg")
-
+        plot_img.save("test_result.jpg")
 
 if __name__ == '__main__':
     main()
-
