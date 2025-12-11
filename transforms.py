@@ -55,3 +55,26 @@ class RandomVerticalFlip(object):
             if "masks" in target:
                 target["masks"] = target["masks"].flip(-2)
         return image, target
+# [请追加到 transforms.py 末尾]
+from torchvision.transforms import ColorJitter as TorchColorJitter
+from torchvision.transforms import GaussianBlur as TorchGaussianBlur
+
+class RandomColorJitter(object):
+    def __init__(self, brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1, prob=0.5):
+        self.transform = TorchColorJitter(brightness, contrast, saturation, hue)
+        self.prob = prob
+
+    def __call__(self, image, target):
+        if random.random() < self.prob:
+            image = self.transform(image)
+        return image, target
+
+class RandomGaussianBlur(object):
+    def __init__(self, kernel_size=(5, 9), sigma=(0.1, 5), prob=0.5):
+        self.transform = TorchGaussianBlur(kernel_size=kernel_size, sigma=sigma)
+        self.prob = prob
+
+    def __call__(self, image, target):
+        if random.random() < self.prob:
+            image = self.transform(image)
+        return image, target
