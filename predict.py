@@ -34,11 +34,11 @@ def time_synchronized():
 
 def main():
     num_classes = 1  # 不包含背景
-    box_thresh = 0.5
+    box_thresh = 0.5        #置信度阈值 (box_thresh)
     
     # ------------------- 配置区域 -------------------
     # 1. 权重文件路径
-    weights_path = "save_weights/model_48.pth" # 请修改为你实际的权重文件名
+    weights_path = "save_weights1/model_84.pth" # 请修改为你实际的权重文件名
     
     # 2. 输入图片文件夹 (改为文件夹路径)
     img_dir = "test_image" 

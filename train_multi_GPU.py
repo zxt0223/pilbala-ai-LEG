@@ -281,5 +281,24 @@ if __name__ == "__main__":
 
 nvidia-smi topo -m
 这会显示 GPU 之间的连接矩阵（PIX, PXB, PHB, SYS 等）。如果显示 SYS，说明跨组需要走系统内存，这正是 NCCL_P2P_DISABLE=1 发挥作用的地方。
-    
+    (base) chenjinming@CCT-8xRTX4090:/group/chenjinming$ nvidia-smi topo -m
+        GPU0    GPU1    GPU2    GPU3    GPU4    GPU5    GPU6    GPU7    CPU Affinity    NUMA Affinity
+GPU0     X      NODE    NODE    NODE    SYS     SYS     SYS     SYS     0-63,128-191    0
+GPU1    NODE     X      NODE    NODE    SYS     SYS     SYS     SYS     0-63,128-191    0
+GPU2    NODE    NODE     X      NODE    SYS     SYS     SYS     SYS     0-63,128-191    0
+GPU3    NODE    NODE    NODE     X      SYS     SYS     SYS     SYS     0-63,128-191    0
+GPU4    SYS     SYS     SYS     SYS      X      NODE    NODE    NODE    64-127,192-255  1
+GPU5    SYS     SYS     SYS     SYS     NODE     X      NODE    NODE    64-127,192-255  1
+GPU6    SYS     SYS     SYS     SYS     NODE    NODE     X      NODE    64-127,192-255  1
+GPU7    SYS     SYS     SYS     SYS     NODE    NODE    NODE     X      64-127,192-255  1
+
+Legend:
+
+  X    = Self
+  SYS  = Connection traversing PCIe as well as the SMP interconnect between NUMA nodes (e.g., QPI/UPI)
+  NODE = Connection traversing PCIe as well as the interconnect between PCIe Host Bridges within a NUMA node
+  PHB  = Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU)
+  PXB  = Connection traversing multiple PCIe bridges (without traversing the PCIe Host Bridge)
+  PIX  = Connection traversing at most a single PCIe bridge
+  NV#  = Connection traversing a bonded set of # NVLinks
     """
