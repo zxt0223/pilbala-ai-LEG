@@ -1,36 +1,48 @@
 import time
 import os
 import datetime
+import argparse
+
 import torch
-import shutil 
-
-# 禁用 NCCL P2P
+# [核心修改] 禁用 P2P 以防死锁
 os.environ["NCCL_P2P_DISABLE"] = "1"
-
-# =========================================================
-# [核心修改] 你的绝对项目根路径
-# 所有的输入(coco2017, 权重) 和 输出(logs, save_weights) 都会基于这个路径
-# =========================================================
-PROJECT_ROOT = "/group/chenjinming/wyy/pytorch-pilipala-LEG"
 
 import transforms
 from my_dataset_coco import CocoDetection
-from backbone.legnet import legnet_fpn_backbone
+# [核心修改] 导入新的 backbone 接口
+from backbone import resnet50_fpn_backbone, resnet18_fpn_backbone, legnet_fpn_backbone
 from network_files import MaskRCNN
 import train_utils.train_eval_utils as utils
 from train_utils import GroupedBatchSampler, create_aspect_ratio_groups, init_distributed_mode, save_on_master, mkdir
-from torch.utils.tensorboard import SummaryWriter
 
-def create_model(num_classes, load_pretrain_weights=True, ablation_mode="full"):
-    # 自动在根目录下找预训练权重
-    weights_path = os.path.join(PROJECT_ROOT, "LWEGNet_tiny.pth")
-    
-    if not os.path.exists(weights_path):
-        print(f"Warning: Pretrained weights not found at {weights_path}, using random init.")
-        weights_path = "" 
-        
-    backbone = legnet_fpn_backbone(pretrain_path=weights_path, ablation_mode=ablation_mode)
+def create_model(num_classes, load_pretrain_weights=True, backbone_name="legnet", ablation_mode="full"):
+    # [核心修改] 动态选择 backbone
+    if backbone_name == "resnet50":
+        # 如果你有 resnet50.pth，请确保路径正确，否则设为 None 或让其自动下载
+        backbone = resnet50_fpn_backbone(pretrain_path="/group/chenjinming/wyy/pytorch-pilipala-LEG/resnet50.pth", trainable_layers=3)
+        print("Using Backbone: ResNet50")
+    elif backbone_name == "resnet18":
+        # 需准备 resnet18.pth
+        backbone = resnet18_fpn_backbone(pretrain_path="/group/chenjinming/wyy/pytorch-pilipala-LEG/resnet18-f37072fd.pth", trainable_layers=3)
+        print("Using Backbone: ResNet18")
+    elif backbone_name == "legnet":
+        # 这里的 pretrain_path 可以指向你在 LEG Github 下载的权重，或者设为 ""
+        backbone = legnet_fpn_backbone(pretrain_path="/group/chenjinming/wyy/pytorch-pilipala-LEG/LWEGNet_tiny.pth", ablation_mode=ablation_mode)
+        print(f"Using Backbone: LEGNet (Ablation Mode: {ablation_mode})")
+    else:
+        raise ValueError(f"Unknown backbone: {backbone_name}")
+
     model = MaskRCNN(backbone, num_classes=num_classes, min_size=1000, max_size=1333)
+
+    if load_pretrain_weights:
+        # 仅针对 ResNet50 加载官方 COCO 权重
+        if backbone_name == "resnet50":
+            weights_dict = torch.load("maskrcnn_resnet50_fpn_coco.pth", map_location="cpu")
+            for k in list(weights_dict.keys()):
+                if ("box_predictor" in k) or ("mask_fcn_logits" in k):
+                    del weights_dict[k]
+            print(model.load_state_dict(weights_dict, strict=False))
+
     return model
 
 def main(args):
@@ -38,30 +50,12 @@ def main(args):
     print(args)
 
     device = torch.device(args.device)
-
-    # ================= [文件路径管理 - 绝对路径版] =================
-    # 1. 确定本次实验的保存文件夹 (例如: /group/.../save_weights/no_scharr)
-    experiment_dir = os.path.join(args.output_dir, args.ablation_mode)
-    
-    if args.rank in [-1, 0]:
-        if not os.path.exists(experiment_dir):
-            os.makedirs(experiment_dir)
-        print(f">> [Output] All results will be saved to: {experiment_dir}")
-
-    # 2. 结果 txt 文件名自动生成
-    now_str = datetime.datetime.now().strftime("%Y%m%d-%H%M")
-    det_results_file = os.path.join(experiment_dir, f"det_results_{args.ablation_mode}_{now_str}.txt")
-    seg_results_file = os.path.join(experiment_dir, f"seg_results_{args.ablation_mode}_{now_str}.txt")
-    # ===========================================================
-
-    # TensorBoard 日志保存到根目录下的 logs/
-    writer = None
-    if args.rank == 0:
-        log_root = os.path.join(PROJECT_ROOT, "logs")
-        log_dir = os.path.join(log_root, f"exp_{args.ablation_mode}_{now_str}")
-        writer = SummaryWriter(log_dir=log_dir)
+    now = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    det_results_file = f"det_results{now}.txt"
+    seg_results_file = f"seg_results{now}.txt"
 
     print("Loading data")
+    # [核心修改] 数据增强
     data_transform = {
         "train": transforms.Compose([
             transforms.ToTensor(),
@@ -73,15 +67,7 @@ def main(args):
         "val": transforms.Compose([transforms.ToTensor()])
     }
 
-    # 强制使用根目录下的 coco2017
-    # 即使命令行不传 --data-path，这里也会覆盖为正确的绝对路径
-    if args.data_path == 'coco2017': # 如果是默认值
-        args.data_path = os.path.join(PROJECT_ROOT, 'coco2017')
-    
     COCO_root = args.data_path
-    if not os.path.exists(COCO_root):
-        raise FileNotFoundError(f"Dataset path not found: {COCO_root}")
-
     train_dataset = CocoDetection(COCO_root, "train", data_transform["train"])
     val_dataset = CocoDetection(COCO_root, "val", data_transform["val"])
 
@@ -99,15 +85,21 @@ def main(args):
     else:
         train_batch_sampler = torch.utils.data.BatchSampler(train_sampler, args.batch_size, drop_last=True)
 
-    data_loader = torch.utils.data.DataLoader(train_dataset, batch_sampler=train_batch_sampler, num_workers=args.workers, collate_fn=train_dataset.collate_fn)
-    data_loader_test = torch.utils.data.DataLoader(val_dataset, batch_size=1, sampler=test_sampler, num_workers=args.workers, collate_fn=train_dataset.collate_fn)
+    data_loader = torch.utils.data.DataLoader(
+        train_dataset, batch_sampler=train_batch_sampler, num_workers=args.workers,
+        collate_fn=train_dataset.collate_fn)
 
-    print(f"Creating model with ablation mode: {args.ablation_mode}")
-    model = create_model(num_classes=args.num_classes + 1, load_pretrain_weights=args.pretrain, ablation_mode=args.ablation_mode)
+    data_loader_test = torch.utils.data.DataLoader(
+        val_dataset, batch_size=1, sampler=test_sampler, num_workers=args.workers,
+        collate_fn=train_dataset.collate_fn)
+
+    print("Creating model")
+    # [核心修改] 传入新参数
+    model = create_model(num_classes=args.num_classes + 1, 
+                         load_pretrain_weights=args.pretrain,
+                         backbone_name=args.backbone,
+                         ablation_mode=args.ablation_mode)
     model.to(device)
-
-    if args.distributed and args.sync_bn:
-        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
     model_without_ddp = model
     if args.distributed:
@@ -116,11 +108,11 @@ def main(args):
 
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.SGD(params, lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
+
     scaler = torch.cuda.amp.GradScaler() if args.amp else None
     lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=args.lr_steps, gamma=args.lr_gamma)
 
     if args.resume:
-        print(f"Resuming from {args.resume}")
         checkpoint = torch.load(args.resume, map_location='cpu')
         model_without_ddp.load_state_dict(checkpoint['model'])
         optimizer.load_state_dict(checkpoint['optimizer'])
@@ -129,122 +121,78 @@ def main(args):
         if args.amp and "scaler" in checkpoint:
             scaler.load_state_dict(checkpoint["scaler"])
 
-    train_loss = []
-    learning_rate = []
-    val_map = []
+    if args.test_only:
+        utils.evaluate(model, data_loader_test, device=device)
+        return
 
     print("Start training")
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
-        mean_loss, lr = utils.train_one_epoch(model, optimizer, data_loader, device, epoch, args.print_freq, warmup=True, scaler=scaler)
-        
-        if writer is not None:
-            writer.add_scalar('Train/Loss', mean_loss.item(), epoch)
-            writer.add_scalar('Train/Learning_Rate', lr, epoch)
-
+        mean_loss, lr = utils.train_one_epoch(model, optimizer, data_loader,
+                                              device, epoch, args.print_freq,
+                                              warmup=True, scaler=scaler)
         lr_scheduler.step()
 
-        # Evaluate
         det_info, seg_info = utils.evaluate(model, data_loader_test, device=device)
 
         if args.rank in [-1, 0]:
-            train_loss.append(mean_loss.item())
-            learning_rate.append(lr)
-            val_map.append(det_info[1]) 
-
-            if writer is not None:
-                writer.add_scalar('Val/Det_mAP_0.5:0.95', det_info[0], epoch)
-                writer.add_scalar('Val/Det_mAP_0.5', det_info[1], epoch)
-                if seg_info is not None:
-                    writer.add_scalar('Val/Seg_mAP_0.5:0.95', seg_info[0], epoch)
-
-            # 写入带模式后缀的 TXT 文件
             with open(det_results_file, "a") as f:
                 result_info = [f"{i:.4f}" for i in det_info + [mean_loss.item()]] + [f"{lr:.6f}"]
-                txt = "epoch:{} {}".format(epoch, '  '.join(result_info))
-                f.write(txt + "\n")
+                f.write("epoch:{} {}\n".format(epoch, '  '.join(result_info)))
 
             if seg_info is not None:
                 with open(seg_results_file, "a") as f:
                     result_info = [f"{i:.4f}" for i in seg_info + [mean_loss.item()]] + [f"{lr:.6f}"]
-                    txt = "epoch:{} {}".format(epoch, '  '.join(result_info))
-                    f.write(txt + "\n")
+                    f.write("epoch:{} {}\n".format(epoch, '  '.join(result_info)))
 
-            # 保存权重到专门的文件夹
-            if args.output_dir:
-                save_files = {'model': model_without_ddp.state_dict(),
-                              'optimizer': optimizer.state_dict(),
-                              'lr_scheduler': lr_scheduler.state_dict(),
-                              'args': args,
-                              'epoch': epoch}
-                if args.amp:
-                    save_files["scaler"] = scaler.state_dict()
-                
-                # 仅保存 model_0.pth, model_1.pth 到子目录
-                save_on_master(save_files, os.path.join(experiment_dir, f'model_{epoch}.pth'))
-
-    # 训练结束：自动画图并归档
-    if args.rank in [-1, 0]:
-        if writer is not None:
-            writer.close()
-        
-        if len(train_loss) != 0 and len(learning_rate) != 0:
-            from plot_curve import plot_loss_and_lr, plot_map
-            plot_loss_and_lr(train_loss, learning_rate)
-            plot_map(val_map)
-            
-            # [新增] 将生成的图片移动到结果文件夹，并改名
-            for img_name in ['loss_and_lr.png', 'mAP.png']:
-                if os.path.exists(img_name):
-                    new_name = f"{img_name.split('.')[0]}_{args.ablation_mode}.png"
-                    dest_path = os.path.join(experiment_dir, new_name)
-                    shutil.move(img_name, dest_path)
-                    print(f"已归档图片: {dest_path}")
+        if args.output_dir:
+            save_files = {'model': model_without_ddp.state_dict(),
+                          'optimizer': optimizer.state_dict(),
+                          'lr_scheduler': lr_scheduler.state_dict(),
+                          'args': args,
+                          'epoch': epoch}
+            if args.amp:
+                save_files["scaler"] = scaler.state_dict()
+            save_on_master(save_files, os.path.join(args.output_dir, f'model_{epoch}.pth'))
 
     total_time = time.time() - start_time
-    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print('Training time {}'.format(total_time_str))
+    print('Training time {}'.format(str(datetime.timedelta(seconds=int(total_time)))))
 
 if __name__ == "__main__":
-    import argparse
     parser = argparse.ArgumentParser(description=__doc__)
-
-    # 设置默认路径为根目录下的路径
-    parser.add_argument('--data-path', default=os.path.join(PROJECT_ROOT, 'coco2017'), help='dataset')
+    parser.add_argument('--data-path', default='wyy/pytorch-pilipala-LEG/coco2017', help='dataset')
     parser.add_argument('--device', default='cuda', help='device')
     parser.add_argument('--num-classes', default=1, type=int, help='num_classes')
-    parser.add_argument('-b', '--batch-size', default=4, type=int, help='images per gpu')
+    parser.add_argument('-b', '--batch-size', default=4, type=int)
     parser.add_argument('--start_epoch', default=0, type=int, help='start epoch')
-    parser.add_argument('--epochs', default=50, type=int, metavar='N', help='number of total epochs to run')
-    parser.add_argument('-j', '--workers', default=4, type=int, metavar='N', help='number of data loading workers')
-    parser.add_argument('--lr', default=0.005, type=float, help='initial learning rate')
-    parser.add_argument('--momentum', default=0.9, type=float, metavar='M', help='momentum')
-    parser.add_argument('--wd', '--weight-decay', default=1e-4, type=float, metavar='W', help='weight decay', dest='weight_decay')
-    parser.add_argument('--lr-step_size', default=8, type=int, help='decrease lr every step-size epochs')
-    parser.add_argument('--lr-steps', default=[35, 45], nargs='+', type=int, help='decrease lr every step-size epochs')
-    parser.add_argument('--lr-gamma', default=0.1, type=float, help='decrease lr by a factor of lr-gamma')
-    parser.add_argument('--print-freq', default=50, type=int, help='print frequency')
-    
-    # 设置默认输出路径为根目录下的 save_weights
-    parser.add_argument('--output-dir', default=os.path.join(PROJECT_ROOT, 'save_weights'), help='root path to save weights')
-    
+    parser.add_argument('--epochs', default=50, type=int, metavar='N')
+    parser.add_argument('-j', '--workers', default=4, type=int, metavar='N')
+    parser.add_argument('--lr', default=0.005, type=float)
+    parser.add_argument('--momentum', default=0.9, type=float, metavar='M')
+    parser.add_argument('--wd', '--weight-decay', default=1e-4, type=float, dest='weight_decay')
+    parser.add_argument('--lr-step_size', default=8, type=int)
+    parser.add_argument('--lr-steps', default=[35, 45], nargs='+', type=int)
+    parser.add_argument('--lr-gamma', default=0.1, type=float)
+    parser.add_argument('--print-freq', default=50, type=int)
+    parser.add_argument('--output-dir', default='multi_train_weights', help='path where to save')
     parser.add_argument('--resume', default='', help='resume from checkpoint')
     parser.add_argument('--aspect-ratio-group-factor', default=3, type=int)
-    parser.add_argument('--test-only', action="store_true", help="test only")
-    parser.add_argument('--world-size', default=4, type=int, help='number of distributed processes')
-    parser.add_argument('--dist-url', default='env://', help='url used to set up distributed training')
+    parser.add_argument('--test-only', action="store_true")
+    parser.add_argument('--world-size', default=4, type=int)
+    parser.add_argument('--dist-url', default='env://')
     parser.add_argument("--sync-bn", dest="sync_bn", help="Use sync batch norm", type=bool, default=False)
-    parser.add_argument("--pretrain", type=bool, default=False, help="load COCO pretrain weights.")
-    parser.add_argument("--amp", default=True, help="Use torch.cuda.amp for mixed precision training")
-    
-    parser.add_argument('--ablation-mode', default='full', type=str, 
-                        help='Mode: full, baseline, no_scharr, no_log, no_gaussian, no_lfea')
+    parser.add_argument("--pretrain", type=bool, default=False)
+    parser.add_argument("--amp", default=True, help="Use torch.cuda.amp")
+
+    # [核心修改] 新增参数定义，这部分就是报错缺失的内容
+    parser.add_argument('--backbone', default='legnet', help='backbone: resnet50, resnet18, legnet')
+    parser.add_argument('--ablation-mode', default='full', 
+                        help='Ablation mode: full, baseline, no_log, no_scharr, no_gaussian, no_lfea')
 
     args = parser.parse_args()
 
-    # 创建根目录
     if args.output_dir:
         mkdir(args.output_dir)
 
@@ -260,6 +208,7 @@ screen -dmS training bash -c "CUDA_VISIBLE_DEVICES=1,2,3 torchrun --nproc_per_no
         
 screen -dmS training bash -c "CUDA_VISIBLE_DEVICES=1,2,3 torchrun --nproc_per_node=3 /group/chenjinming/wyy/pytorch-pilipala-LEG/train_multi_GPU.py --batch-size 4 --lr 0.015 --epochs 50 --lr-steps 35 45 2>&1 | tee training_no_gaussian.log"
 screen -dmS training bash -c "CUDA_VISIBLE_DEVICES=1,2,3 torchrun --nproc_per_node=3 /group/chenjinming/wyy/pytorch-pilipala-LEG/train_multi_GPU.py --batch-size 4 --lr 0.015 --epochs 50 --lr-steps 35 45 2>&1 | tee training_no_lfea.log"       
+    screen -dmS train_job bash -c "CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 train_multi_GPU.py 2>&1 | tee train_log.txt; exec bash"
     配置方案,GPU 数量,每卡 Batch Size,总 Batch Size,推荐学习率 (--lr),下降节点 (--lr-steps),说明
     方案 A,     2 张,       4,          8,              0.008,          35 45,              学习率翻倍
     方案 B,     3 张,       4,          12,             0.012,          35 45,              学习率 x3

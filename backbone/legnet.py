@@ -190,6 +190,8 @@ class LFE_Module(nn.Module):
                     act_layer(),
                     Conv_Extra(dim, act_layer)
                 )
+            # [修改] 为 Scharr 阶段添加可学习权重
+            self.scharr_weight = nn.Parameter(torch.zeros(1))
         else:
             if use_gaussian:
                 self.gaussian = Gaussian(dim, 5, 1.0, act_layer)
@@ -202,15 +204,17 @@ class LFE_Module(nn.Module):
         self.norm = get_norm(dim)
 
     def forward(self, x: Tensor) -> Tensor:
+        # [修改] 对 Stage 0 (Scharr) 使用加权求和，跳过标准 LFEA/Add 逻辑
         if self.stage == 0:
             att = self.edge_extractor(x)
+            # 使用可学习权重，初始为 0，让网络自己决定是否需要 Scharr 噪声
+            x_att = x + self.scharr_weight * att
         else:
             att = self.gaussian(x)
-        
-        if self.use_lfea:
-            x_att = self.LFEA(x, att)
-        else:
-            x_att = x + att 
+            if self.use_lfea:
+                x_att = self.LFEA(x, att)
+            else:
+                x_att = x + att 
             
         x = x + self.norm(self.drop_path(self.mlp(x_att)))
         return x
