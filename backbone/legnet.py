@@ -30,22 +30,36 @@ class Conv_Extra(nn.Module):
 class Scharr(nn.Module):
     def __init__(self, channel, act_layer):
         super(Scharr, self).__init__()
+        # 定义 Scharr 算子核
         scharr_x = torch.tensor([[-3., 0., 3.], [-10., 0., 10.], [-3., 0., 3.]], dtype=torch.float32).unsqueeze(0).unsqueeze(0)
         scharr_y = torch.tensor([[-3., -10., -3.], [0., 0., 0.], [3., 10., 3.]], dtype=torch.float32).unsqueeze(0).unsqueeze(0)
         
         self.conv_x = nn.Conv2d(channel, channel, kernel_size=3, padding=1, groups=channel, bias=False)
         self.conv_y = nn.Conv2d(channel, channel, kernel_size=3, padding=1, groups=channel, bias=False)
         
+        # 固定权重，不可训练
         self.conv_x.weight.data = scharr_x.repeat(channel, 1, 1, 1)
         self.conv_y.weight.data = scharr_y.repeat(channel, 1, 1, 1)
+        self.conv_x.weight.requires_grad = False
+        self.conv_y.weight.requires_grad = False
+        
         self.norm = get_norm(channel)
         self.act = act_layer()
         self.conv_extra = Conv_Extra(channel, act_layer)
+        
+        # [可视化] 初始化 debug 容器
+        self.debug_feat = None
 
     def forward(self, x):
         edges_x = self.conv_x(x)
         edges_y = self.conv_y(x)
+        # 计算纯边缘强度 (不经过融合)
         scharr_edge = torch.sqrt(edges_x ** 2 + edges_y ** 2 + 1e-6)
+        
+        # >>>>> [关键] 埋点：保存纯边缘特征供可视化 (Pre-Fusion) <<<<<
+        self.debug_feat = scharr_edge.detach() 
+        
+        # 后续正常处理 (归一化 -> 激活 -> 融合)
         scharr_edge = self.act(self.norm(scharr_edge))
         out = self.conv_extra(x + scharr_edge)
         return out
@@ -60,11 +74,15 @@ class Gaussian(nn.Module):
         
         self.gaussian = nn.Conv2d(dim, dim, kernel_size=size, stride=1, padding=int(size // 2), groups=dim, bias=False)
         self.gaussian.weight.data = self.gaussian_kernel_weight
-        self.gaussian.weight.requires_grad = False 
+        self.gaussian.weight.requires_grad = False  # 固定高斯核
+        
         self.norm = get_norm(dim)
         self.act = act_layer()
         if feature_extra:
             self.conv_extra = Conv_Extra(dim, act_layer)
+            
+        # [可视化] 初始化 debug 容器
+        self.debug_feat = None
 
     def gaussian_kernel(self, size: int, sigma: float):
         kernel = torch.FloatTensor([
@@ -76,6 +94,10 @@ class Gaussian(nn.Module):
 
     def forward(self, x):
         edges_o = self.gaussian(x)
+        
+        # >>>>> [关键] 埋点：保存纯高斯热力图 (Pre-Fusion) <<<<<
+        self.debug_feat = edges_o.detach()
+        
         gaussian = self.act(self.norm(edges_o))
         if self.feature_extra:
             out = self.conv_extra(x + gaussian)
@@ -87,19 +109,22 @@ class LoGFilter(nn.Module):
     def __init__(self, in_c, out_c, kernel_size, sigma, act_layer):
         super(LoGFilter, self).__init__()
         self.conv_init = nn.Conv2d(in_c, out_c, kernel_size=7, stride=1, padding=3)
+        
+        # [警告修复] 显式指定 indexing='ij'
         ax = torch.arange(-(kernel_size // 2), (kernel_size // 2) + 1, dtype=torch.float32)
         xx, yy = torch.meshgrid(ax, ax, indexing='ij')
+        
         kernel = (xx**2 + yy**2 - 2 * sigma**2) / (2 * math.pi * sigma**4) * torch.exp(-(xx**2 + yy**2) / (2 * sigma**2))
         kernel = kernel - kernel.mean()
         kernel = kernel / kernel.sum()
         log_kernel = kernel.unsqueeze(0).unsqueeze(0)
         
-        # [DDP 修复] 使用 register_buffer
         self.register_buffer('log_kernel_weight', log_kernel.repeat(out_c, 1, 1, 1))
         
         self.LoG = nn.Conv2d(out_c, out_c, kernel_size=kernel_size, stride=1, padding=int(kernel_size // 2), groups=out_c, bias=False)
         self.LoG.weight.data = self.log_kernel_weight
         self.LoG.weight.requires_grad = False
+        
         self.act = act_layer()
         self.norm1 = get_norm(out_c)
         self.norm2 = get_norm(out_c)
@@ -112,7 +137,7 @@ class LoGFilter(nn.Module):
         return x
 
 # ==========================================
-# 3. 网络结构组件
+# 3. 网络结构组件 (LFEA, DRFD, LFE_Module)
 # ==========================================
 class DRFD(nn.Module):
     def __init__(self, dim, act_layer):
@@ -168,53 +193,58 @@ class LFE_Module(nn.Module):
         self.stage = stage
         self.use_lfea = use_lfea
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = nn.Sequential(
             nn.Conv2d(dim, mlp_hidden_dim, 1, bias=False),
             get_norm(mlp_hidden_dim), act_layer(),
             nn.Conv2d(mlp_hidden_dim, dim, 1, bias=False))
         
-        # 根据开关决定是否初始化 LFEA
+        # [真消融] 真正可选的 LFEA
         if self.use_lfea:
             self.LFEA = LFEA(dim, act_layer)
         else:
             self.LFEA = None
 
+        # [真消融] 真正可选的 Scharr 和 Gaussian (设为 None)
         if stage == 0:
             if use_scharr:
                 self.edge_extractor = Scharr(dim, act_layer)
             else:
-                self.edge_extractor = nn.Sequential(
-                    nn.Conv2d(dim, dim, 3, padding=1, groups=dim, bias=False),
-                    get_norm(dim),
-                    act_layer(),
-                    Conv_Extra(dim, act_layer)
-                )
-            # [修改] 为 Scharr 阶段添加可学习权重
-            self.scharr_weight = nn.Parameter(torch.zeros(1))
+                self.edge_extractor = None  # No Scharr = 该分支不存在
+            
+            # [改进] 智能初始化，避免梯度为 0
+            self.scharr_weight = nn.Parameter(torch.tensor([0.1])) 
         else:
             if use_gaussian:
                 self.gaussian = Gaussian(dim, 5, 1.0, act_layer)
             else:
-                self.gaussian = nn.Sequential(
-                    nn.Conv2d(dim, dim, 5, padding=2, groups=dim, bias=False),
-                    get_norm(dim),
-                    act_layer()
-                )
+                self.gaussian = None  # No Gaussian = 该分支不存在
+                
         self.norm = get_norm(dim)
 
     def forward(self, x: Tensor) -> Tensor:
-        # [修改] 对 Stage 0 (Scharr) 使用加权求和，跳过标准 LFEA/Add 逻辑
+        # Stage 0: 处理边缘 (Scharr)
         if self.stage == 0:
-            att = self.edge_extractor(x)
-            # 使用可学习权重，初始为 0，让网络自己决定是否需要 Scharr 噪声
-            x_att = x + self.scharr_weight * att
-        else:
-            att = self.gaussian(x)
-            if self.use_lfea:
-                x_att = self.LFEA(x, att)
+            if self.edge_extractor is not None:
+                att = self.edge_extractor(x)
+                x_att = x + self.scharr_weight * att
             else:
-                x_att = x + att 
+                # [真消融] No Scharr 模式：直接透传
+                x_att = x 
+        
+        # Stage 1-3: 处理高斯 (Gaussian)
+        else:
+            if self.gaussian is not None:
+                att = self.gaussian(x)
+                if self.use_lfea:
+                    x_att = self.LFEA(x, att)
+                else:
+                    # [真消融] No LFEA 模式：直接相加
+                    x_att = x + att 
+            else:
+                # [真消融] No Gaussian 模式
+                x_att = x 
             
         x = x + self.norm(self.drop_path(self.mlp(x_att)))
         return x
@@ -268,10 +298,11 @@ class Stem(nn.Module):
 # ==========================================
 class LWEGNet(nn.Module):
     def __init__(self, in_chans=3, stem_dim=32, depths=(1, 4, 4, 2), act_layer=nn.ReLU, 
-                 mlp_ratio=2., drop_path_rate=0.1, pretrained=None,
+                 mlp_ratio=2., drop_path_rate=0.1, pretrained=None, trainable_layers=5,
                  use_log=True, use_scharr=True, use_gaussian=True, use_lfea=True):
         super().__init__()
         self.num_stages = len(depths)
+        self.stem_dim = stem_dim
         self.Stem = Stem(in_chans=in_chans, stem_dim=stem_dim, act_layer=act_layer, use_log=use_log)
         
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
@@ -286,10 +317,15 @@ class LWEGNet(nn.Module):
                 stages_list.append(DRFD(dim=dim, act_layer=act_layer))
         self.stages = nn.Sequential(*stages_list)
         
+        # 权重加载
         if pretrained:
             self._load_pretrained_weights(pretrained)
         else:
             self.apply(self._init_weights)
+
+        # 冻结层逻辑
+        if trainable_layers < 5:
+            self._freeze_stages(trainable_layers)
 
     def _init_weights(self, m):
         if isinstance(m, (nn.Conv2d, nn.Linear)):
@@ -299,28 +335,29 @@ class LWEGNet(nn.Module):
         elif isinstance(m, nn.BatchNorm2d):
             nn.init.constant_(m.weight, 1)
             nn.init.constant_(m.bias, 0)
+    
+    def _freeze_stages(self, trainable_layers):
+        if trainable_layers < 1:
+            for p in self.Stem.parameters(): p.requires_grad = False
+        
+        layers_to_freeze = 5 - trainable_layers
+        if layers_to_freeze > 0:
+            for i in range(layers_to_freeze - 1):
+                if i < len(self.stages):
+                    for p in self.stages[i].parameters(): p.requires_grad = False
+                    print(f"[Info] Freezing Stage {i}")
 
     def _load_pretrained_weights(self, path):
         print(f"Loading LEGNet pretrained weights from {path}...")
         try:
             checkpoint = torch.load(path, map_location='cpu')
-            if 'state_dict' in checkpoint:
-                state_dict = checkpoint['state_dict']
-            elif 'model' in checkpoint:
-                state_dict = checkpoint['model']
-            else:
-                state_dict = checkpoint
+            state_dict = checkpoint['state_dict'] if 'state_dict' in checkpoint else (checkpoint['model'] if 'model' in checkpoint else checkpoint)
             new_state_dict = {}
             for k, v in state_dict.items():
-                if k.startswith('backbone.'):
-                    new_state_dict[k[9:]] = v
-                else:
-                    new_state_dict[k] = v
+                k = k.replace('backbone.', '')
+                new_state_dict[k] = v
             missing, unexpected = self.load_state_dict(new_state_dict, strict=False)
-            if len(missing) == 0:
-                print(">> Success: All LEGNet weights loaded perfectly!")
-            else:
-                print(f">> Loaded partially. Missing keys: {len(missing)}")
+            print(f">> Weights loaded. Missing: {len(missing)}, Unexpected: {len(unexpected)}")
         except Exception as e:
             print(f"[Error] Failed to load weights: {e}")
 
@@ -337,38 +374,46 @@ class LWEGNet(nn.Module):
 # ==========================================
 # 5. 对外接口 legnet_fpn_backbone
 # ==========================================
-def legnet_fpn_backbone(pretrain_path="", ablation_mode="full", **kwargs):
+def legnet_fpn_backbone(pretrain_path="", ablation_mode="full", trainable_layers=3, **kwargs):
+    # 默认配置
     use_log = True
     use_scharr = True
     use_gaussian = True
     use_lfea = True
     
-    # 智能开关逻辑
-    if ablation_mode == "baseline":
+    # === 智能模式切换逻辑 ===
+    mode = str(ablation_mode).lower().strip()
+    
+    if mode == "baseline":
         use_log = False; use_scharr = False; use_gaussian = False; use_lfea = False
-        print("!!! [Ablation Study] Mode: BASELINE (All operators disabled) !!!")
-    elif ablation_mode == "no_log":
+        print(f"!!! [LEGNet] Mode: BASELINE (All Modules Disabled) !!!")
+    elif mode == "no_log":
         use_log = False
-        print("!!! [Ablation Study] Mode: NO LoG !!!")
-    elif ablation_mode == "no_scharr":
+        print(f"!!! [LEGNet] Mode: NO LoG (LoG -> Conv) !!!")
+    elif mode == "no_scharr":
         use_scharr = False
-        print("!!! [Ablation Study] Mode: NO Scharr !!!")
-    elif ablation_mode == "no_gaussian":
+        print(f"!!! [LEGNet] Mode: NO Scharr (Branch Removed) !!!")
+    elif mode == "no_gaussian":
         use_gaussian = False
-        print("!!! [Ablation Study] Mode: NO Gaussian !!!")
-    elif ablation_mode == "no_lfea":
+        print(f"!!! [LEGNet] Mode: NO Gaussian (Branch Removed) !!!")
+    elif mode == "no_lfea":
         use_lfea = False
-        print("!!! [Ablation Study] Mode: NO LFEA !!!")
+        print(f"!!! [LEGNet] Mode: NO LFEA (Use Add) !!!")
     else:
-        print(f"!!! [Ablation Study] Mode: FULL (Using standard LEGNet) !!!")
+        print(f"!!! [LEGNet] Mode: FULL (All Modules Enabled) !!!")
 
-    backbone = LWEGNet(stem_dim=32, depths=(1, 4, 4, 2), 
+    stem_dim = 32
+    
+    backbone = LWEGNet(stem_dim=stem_dim, depths=(1, 4, 4, 2), 
                        pretrained=pretrain_path if pretrain_path else None,
+                       trainable_layers=trainable_layers,
                        use_log=use_log, 
                        use_scharr=use_scharr, 
                        use_gaussian=use_gaussian,
                        use_lfea=use_lfea)
     
-    in_channels_list = [32, 64, 128, 256]
+    # 动态计算 Channels
+    in_channels_list = [int(stem_dim * 2 ** i) for i in range(4)]
+    
     return BackboneWithFPN(backbone, return_layers=None, 
                            in_channels_list=in_channels_list, out_channels=256, re_getter=False)
