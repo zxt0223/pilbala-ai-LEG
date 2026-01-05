@@ -69,7 +69,14 @@
 
 总结： 用 visualize_full_pipeline.py 跑出来的真实热力图，嵌入到你画的 Visio 流程框图中，这种 "原理框图 + 真实数据验证" 的图，是顶刊（如 IEEE Trans）最喜欢的风格！
 """
-
+"""
+LEGNet 可视化流水线 (Paper Ready)
+功能：生成包含 [原图 -> LoG -> Scharr -> LFEA -> Gaussian Deep -> Mask] 的全流程分解图
+改进：
+1. 修正了模型层级索引 (stages[0] 等)。
+2. 直接提取算子内部的 debug_feat (纯净特征)，而非融合后的 output。
+3. 针对不同特征类型使用了不同的色卡 (Edges用HOT, Areas用JET)。
+"""
 import torch
 import torch.nn as nn
 import cv2
@@ -78,40 +85,51 @@ import matplotlib.pyplot as plt
 import os
 from PIL import Image
 from torchvision import transforms
+from collections import OrderedDict
+import glob
+import re
 
 # 引入你的模型
 from backbone.legnet import legnet_fpn_backbone
 from network_files import MaskRCNN
 
 # ================= 配置区 =================
-# 图片路径 (换成你的石头图)
+# 图片路径
 IMG_PATH = r"D:\MASKRCNN_daima\111111mask_rcnn_B_up_pilibala\test_image\p2.jpg" 
-# 权重路径 (如果没有训练好的，留空 "" 也可以看Scharr/LoG/Gaussian的效果)
-WEIGHTS_PATH = "save_weights1/model_84.pth" 
+# 权重目录 (脚本会自动找里面最新的 .pth)
+WEIGHTS_DIR = "./save_weight-1.3"
 # 输出文件夹
-OUTPUT_DIR = "vis_pipeline_results"
+OUTPUT_DIR = "vis_pipeline_paper"
 # =========================================
 
-def normalize_to_heatmap(tensor):
-    """将 [C, H, W] 的特征图压缩为热力图"""
+def find_best_weights_simple(base_dir):
+    """简单寻找目录下最新的pth文件 (支持任意文件名)"""
+    if not os.path.exists(base_dir): return ""
+    # 修改点：搜索所有 *.pth
+    pths = glob.glob(os.path.join(base_dir, "*.pth"))
+    # 同时也搜子目录
+    pths += glob.glob(os.path.join(base_dir, "**", "*.pth"), recursive=True)
+    
+    if not pths: return ""
+    
+    # 按数字排序，如果没有数字则返回第一个
+    def get_epoch(p):
+        nums = re.findall(r'\d+', os.path.basename(p))
+        return int(nums[-1]) if nums else -1
+        
+    return max(pths, key=get_epoch)
+
+def normalize_to_heatmap(tensor, colormap=cv2.COLORMAP_JET):
     if tensor is None: return None
-    if tensor.dim() == 4: tensor = tensor.squeeze(0) # 去掉 Batch 维
-    
-    # 1. Channel Max Pooling (把64个通道压扁成1个，取最大响应)
-    # 也可以用 mean(dim=0)，但 max 更能体现“有没有检测到特征”
+    if tensor.dim() == 4: tensor = tensor.squeeze(0) 
     map_data = torch.max(tensor, dim=0)[0].cpu().detach().numpy()
-    
-    # 2. 归一化到 0-255
     min_val, max_val = map_data.min(), map_data.max()
     if max_val - min_val > 1e-6:
         map_data = (map_data - min_val) / (max_val - min_val)
     else:
         map_data = np.zeros_like(map_data)
-        
     map_data = np.uint8(255 * map_data)
-    
-    # 3. 转热力图 (蓝色=弱, 红色=强)
-    heatmap = cv2.applyColorMap(map_data, cv2.COLORMAP_JET)
+    heatmap = cv2.applyColorMap(map_data, colormap)
     heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
     return heatmap
 
@@ -119,55 +137,50 @@ def visualize_pipeline():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if not os.path.exists(OUTPUT_DIR): os.makedirs(OUTPUT_DIR)
 
-    # --- 1. 构建模型 ---
-    print("构建模型...")
+    print("构建 LEGNet 模型 (Full Mode)...")
     backbone = legnet_fpn_backbone(pretrain_path="", ablation_mode="full")
     model = MaskRCNN(backbone, num_classes=2)
     
-    # 加载权重
-    if os.path.exists(WEIGHTS_PATH):
-        print(f"加载权重: {WEIGHTS_PATH}")
-        ckpt = torch.load(WEIGHTS_PATH, map_location=device)
-        model.load_state_dict(ckpt['model'] if 'model' in ckpt else ckpt, strict=False)
+    weights_path = find_best_weights_simple(WEIGHTS_DIR)
+    if weights_path:
+        print(f"加载权重: {weights_path}")
+        try:
+            ckpt = torch.load(weights_path, map_location=device)
+            state_dict = ckpt['model'] if 'model' in ckpt else ckpt
+            new_state_dict = OrderedDict()
+            for k, v in state_dict.items():
+                name = k[7:] if k.startswith('module.') else k
+                new_state_dict[name] = v
+            model.load_state_dict(new_state_dict, strict=False)
+        except Exception as e:
+            print(f"[Warn] 权重加载失败: {e}")
     else:
-        print("未找到权重，使用随机初始化 (Scharr/LoG/Gaussian 依然有效，因为它们是固定的)")
+        print(f"[Warn] 在 {WEIGHTS_DIR} 未找到任何 .pth 文件！")
 
     model.to(device)
     model.eval()
 
-    # --- 2. 注册钩子 (Hook) ---
-    # 这是一个字典，用来存放所有层的输出
     activations = {}
-
     def get_activation(name):
         def hook(model, input, output):
             activations[name] = output.detach()
         return hook
 
-    print("注册钩子...")
-    # 这里的路径是根据 legnet.py 的结构推导出来的
-    # body -> Stem -> LoG
-    model.backbone.body.Stem.LoG.register_forward_hook(get_activation('1_LoG_Layer'))
+    # Hook LoG Raw
+    model.backbone.body.Stem.LoG.LoG.register_forward_hook(get_activation('1_LoG_Raw'))
     
-    # body -> layer1 (Stage 1) -> Block 0 -> edge_extractor (Scharr)
-    model.backbone.body.layer1[0].edge_extractor.register_forward_hook(get_activation('2_Scharr_Layer'))
-    
-    # body -> layer1 (Stage 1) -> Block 0 -> lfea (LFEA 融合后)
-    model.backbone.body.layer1[0].lfea.register_forward_hook(get_activation('3_LFEA_Stage1'))
+    # Hook LFEA Stage 1
+    if hasattr(model.backbone.body.stages[0].blocks[0], 'LFEA'):
+        model.backbone.body.stages[0].blocks[0].LFEA.register_forward_hook(get_activation('3_LFEA_Stage1'))
 
-    # body -> layer2 (Stage 2) -> Block 0 -> gaussian
-    model.backbone.body.layer2[0].gaussian.register_forward_hook(get_activation('4_Gaussian_Stage2'))
-    
-    # body -> layer3 (Stage 3) -> Block 0 -> gaussian
-    model.backbone.body.layer3[0].gaussian.register_forward_hook(get_activation('5_Gaussian_Stage3'))
+    # Hook LFEA Stage 4
+    if hasattr(model.backbone.body.stages[6].blocks[0], 'LFEA'):
+        model.backbone.body.stages[6].blocks[0].LFEA.register_forward_hook(get_activation('7_LFEA_Stage4'))
 
-    # body -> layer4 (Stage 4) -> Block 0 -> gaussian
-    model.backbone.body.layer4[0].gaussian.register_forward_hook(get_activation('6_Gaussian_Stage4'))
+    if not os.path.exists(IMG_PATH):
+        print(f"[Error] 图片路径不存在: {IMG_PATH}")
+        return
 
-    # body -> layer4 (Stage 4) -> Block 0 -> lfea (深层 LFEA)
-    model.backbone.body.layer4[0].lfea.register_forward_hook(get_activation('7_LFEA_Stage4'))
-
-    # --- 3. 推理 ---
     img = Image.open(IMG_PATH).convert('RGB')
     transform = transforms.Compose([transforms.ToTensor()])
     img_tensor = transform(img).unsqueeze(0).to(device)
@@ -175,32 +188,38 @@ def visualize_pipeline():
     print("开始推理...")
     model(img_tensor)
 
-    # --- 4. 绘图 (分解图) ---
-    print("生成分解图...")
-    keys = sorted(activations.keys()) # 按名称排序 1_LoG, 2_Scharr...
-    num_plots = len(keys) + 1 # +1 是原图
-    
-    plt.figure(figsize=(20, 8)) # 设置画布大小
-    
-    # 画原图
-    plt.subplot(2, 4, 1) # 2行4列布局
-    plt.imshow(img)
-    plt.title("0_Original_Image")
-    plt.axis('off')
+    # Debug Feats
+    activations['2_Scharr_Raw'] = model.backbone.body.stages[0].blocks[0].edge_extractor.debug_feat
+    activations['4_Gaussian_Stage2'] = model.backbone.body.stages[2].blocks[0].gaussian.debug_feat
+    activations['5_Gaussian_Stage3'] = model.backbone.body.stages[4].blocks[0].gaussian.debug_feat
+    activations['6_Gaussian_Stage4'] = model.backbone.body.stages[6].blocks[0].gaussian.debug_feat
 
-    # 画各个层的特征图
-    for i, k in enumerate(keys):
-        heatmap = normalize_to_heatmap(activations[k])
-        
-        # 自动安排位置 (假设一共8张图)
-        plt.subplot(2, 4, i + 2) 
-        plt.imshow(heatmap)
-        plt.title(k)
-        plt.axis('off')
+    # Plot
+    print("生成可视化图表...")
+    plot_config = [
+        ('1_LoG_Raw', 'LoG Filter', cv2.COLORMAP_HOT),
+        ('2_Scharr_Raw', 'Scharr Operator', cv2.COLORMAP_HOT),
+        ('3_LFEA_Stage1', 'LFEA Shallow', cv2.COLORMAP_JET),
+        ('4_Gaussian_Stage2', 'Gaussian S2', cv2.COLORMAP_JET),
+        ('5_Gaussian_Stage3', 'Gaussian S3', cv2.COLORMAP_JET),
+        ('6_Gaussian_Stage4', 'Gaussian S4', cv2.COLORMAP_JET),
+        ('7_LFEA_Stage4', 'LFEA Deep', cv2.COLORMAP_JET),
+    ]
+    
+    num_plots = len(plot_config) + 1
+    plt.figure(figsize=(24, 5))
+    plt.subplot(1, num_plots, 1)
+    plt.imshow(img); plt.title("Input"); plt.axis('off')
 
-    save_path = os.path.join(OUTPUT_DIR, "LEGNet_Process_Decomposition.png")
-    plt.savefig(save_path, bbox_inches='tight', dpi=150)
-    print(f"分解图已保存至: {save_path}")
+    for i, (key, title, cmap) in enumerate(plot_config):
+        if key in activations and activations[key] is not None:
+            heatmap = normalize_to_heatmap(activations[key], colormap=cmap)
+            plt.subplot(1, num_plots, i + 2)
+            plt.imshow(heatmap); plt.title(title); plt.axis('off')
+
+    save_path = os.path.join(OUTPUT_DIR, "LEGNet_Pipeline_Vis.png")
+    plt.savefig(save_path, bbox_inches='tight', dpi=300)
+    print(f"完成！图片已保存至: {save_path}")
     plt.show()
 
 if __name__ == "__main__":

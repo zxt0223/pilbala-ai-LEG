@@ -6,15 +6,49 @@ import torch
 import numpy as np
 from PIL import Image
 from torchvision import transforms
-import glob
+from collections import OrderedDict
+import warnings
+
+# 屏蔽警告
+warnings.filterwarnings("ignore")
 
 # 导入必要模块
 from network_files import MaskRCNN
 from backbone.legnet import legnet_fpn_backbone
 from draw_box_utils import draw_objs
 
+# ==============================================================================
+# 【用户配置区】请在这里直接填入您的权重路径
+# ==============================================================================
+WEIGHTS_CONFIG = {
+    # 1. Full 模式 (完整模型)
+    "full": r"D:\MASKRCNN_daima\111111mask_rcnn_B_up_pilibala\save_weight-1.3\LegNetFull_Run2_Epoch21.pth", 
+    
+    # 2. Baseline 模式 (基础 ResNet 或 全禁用)
+    "baseline": r"D:\MASKRCNN_daima\111111mask_rcnn_B_up_pilibala\save_weight-1.3\LegNetBaseline_Run2_Epoch23.pth", 
+
+    # 3. No LoG (无 LoG 滤波) -> [新增] 在这里填入 no_log 实验的权重
+    "no_log":  r"D:\MASKRCNN_daima\111111mask_rcnn_B_up_pilibala\save_weight-1.3\LegNetNoLog_Run3_Epoch20.pth",  
+    
+    # 4. No Scharr (无边缘算子)
+    "no_scharr": r"D:\MASKRCNN_daima\111111mask_rcnn_B_up_pilibala\save_weight-1.3\LegNetNoScharr_Run1_Epoch21.pth",  
+    
+    # 5. No Gaussian (无高斯去噪)
+    "no_gaussian":  r"D:\MASKRCNN_daima\111111mask_rcnn_B_up_pilibala\save_weight-1.3\LegNetNoGaussian_Run2_Epoch23.pth",
+    
+    # 6. No LFEA (无融合模块)
+    "no_lfea": r"D:\MASKRCNN_daima\111111mask_rcnn_B_up_pilibala\save_weight-1.3\LegNetNoLFEA_Run2_Epoch22.pth"
+}
+# ==============================================================================
+
 def create_model(num_classes, box_thresh=0.5, ablation_mode="full"):
-    """创建标准的 LEGNet 模型 (2类)"""
+    """创建模型"""
+    # [修改] 加入 'no_log' 到合法列表
+    valid_modes = ["full", "baseline", "no_log", "no_scharr", "no_gaussian", "no_lfea"]
+    if ablation_mode not in valid_modes:
+        print(f"    [Warn] Unknown mode '{ablation_mode}', defaulting to 'full'")
+        ablation_mode = "full"
+
     backbone = legnet_fpn_backbone(pretrain_path="", ablation_mode=ablation_mode)
     model = MaskRCNN(backbone,
                      num_classes=num_classes,
@@ -22,30 +56,6 @@ def create_model(num_classes, box_thresh=0.5, ablation_mode="full"):
                      rpn_score_thresh=box_thresh,
                      box_score_thresh=box_thresh)
     return model
-
-def find_best_weights(base_dir, mode_name):
-    """
-    自动寻找该模式下最新的权重文件
-    策略：优先找 run1, run2, run3 中 epoch 最大的文件 (例如 model_23.pth)
-    """
-    # 假设路径结构: zxt_checkpoints/legnet_{mode}_run{i}/model_{epoch}.pth
-    search_pattern = os.path.join(base_dir, f"legnet_{mode_name}_run*", "model_*.pth")
-    files = glob.glob(search_pattern)
-    
-    if not files:
-        return None
-    
-    # 按修改时间排序，或者按 epoch 数字排序
-    # 这里我们简单粗暴：找文件名里数字最大的（通常是最后一个 epoch）
-    # 比如 model_23.pth > model_5.pth
-    def extract_epoch(path):
-        try:
-            return int(path.split("_")[-1].split(".")[0])
-        except:
-            return -1
-            
-    best_file = max(files, key=extract_epoch)
-    return best_file
 
 def main(args):
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -64,27 +74,27 @@ def main(args):
         print(f"[Error] Input dir {args.input_dir} not found.")
         return
 
-    # 3. 强制定义 Stone 标签
-    category_index = {1: 'stone'}
+    # 3. 标签定义 (Key 必须是字符串)
+    category_index = {'1': 'stone'}
 
-    # 4. 定义要预测的消融模式
-    # 这些必须与 zxt_run_all.sh 中的 LEG_MODES 对应
-    ablation_modes = ["full", "baseline", "no_scharr", "no_gaussian", "no_lfea"]
+    print(f"Found {len(img_list)} images. Starting comparison loop...")
 
-    print(f"Found {len(img_list)} images. Starting prediction loop...")
-
-    for mode in ablation_modes:
+    # 4. 遍历配置字典
+    for mode, weights_path in WEIGHTS_CONFIG.items():
         print(f"\n>>> Processing Mode: {mode.upper()}")
         
-        # 自动寻找权重
-        weights_path = find_best_weights(args.checkpoints_dir, mode)
+        # 检查路径是否为空或文件是否存在
         if not weights_path:
-            print(f"    [Skip] No weights found for mode '{mode}' in {args.checkpoints_dir}")
+            print(f"    [Skip] 路径配置为空，跳过。")
+            continue
+        
+        if not os.path.exists(weights_path):
+            print(f"    [Skip] 文件不存在: {weights_path}")
             continue
             
         print(f"    [Load] Weights: {weights_path}")
 
-        # 创建模型 (num_classes=2: 1 stone + 1 background)
+        # 创建模型
         model = create_model(num_classes=2, 
                              box_thresh=args.box_thresh, 
                              ablation_mode=mode)
@@ -93,7 +103,15 @@ def main(args):
         try:
             checkpoint = torch.load(weights_path, map_location='cpu')
             state_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
-            model.load_state_dict(state_dict, strict=True) # 此时应该是严格匹配的
+            
+            # 去掉 module. 前缀
+            new_state_dict = OrderedDict()
+            for k, v in state_dict.items():
+                name = k[7:] if k.startswith('module.') else k
+                new_state_dict[name] = v
+            state_dict = new_state_dict
+
+            model.load_state_dict(state_dict, strict=False) 
             model.to(device)
             model.eval()
         except Exception as e:
@@ -118,6 +136,7 @@ def main(args):
                 predict_mask = np.squeeze(predict_mask, axis=1)
 
                 if len(predict_boxes) == 0:
+                    print(f"    -> {file_name}: No objects detected.")
                     continue
 
                 plot_img = draw_objs(original_img,
@@ -130,7 +149,7 @@ def main(args):
                                      font='arial.ttf',
                                      font_size=20)
                 
-                # 保存: full_stone.jpg
+                # 保存文件名：full_image.jpg, no_log_image.jpg
                 save_name = f"{mode}_{file_name}"
                 plot_img.save(os.path.join(args.output_dir, save_name))
                 print(f"    -> Saved: {save_name}")
@@ -138,10 +157,9 @@ def main(args):
     print(f"\nAll Done! Results in: {args.output_dir}")
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Predict newly retrained LEGNet models")
+    parser = argparse.ArgumentParser(description="Predict LEGNet Comparison")
     parser.add_argument('--input-dir', default='./test_image', help='测试图片文件夹')
     parser.add_argument('--output-dir', default='./comparison_results_new', help='结果保存路径')
-    parser.add_argument('--checkpoints-dir', default='./zxt_checkpoints', help='权重根目录')
     parser.add_argument('--box-thresh', type=float, default=0.5, help='置信度阈值')
     
     args = parser.parse_args()
