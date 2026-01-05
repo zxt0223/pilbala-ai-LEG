@@ -6,15 +6,16 @@
 你的目标是写一个完全类似的函数，但实例化的是 LEG 类，并配置正确的 return_layers 和 in_channels_list。
 只要这两个配置对了，BackboneWithFPN 就能帮你搞定剩下的特征融合工作，Mask R-CNN 的其余部分就能无缝对接了。
 
-"""
+"""# 文件路径: backbone/resnet50_fpn_model.py
 import os
-
 import torch
 import torch.nn as nn
 from torchvision.ops.misc import FrozenBatchNorm2d
-
 from .feature_pyramid_network import BackboneWithFPN, LastLevelMaxPool
 
+# =======================================================================
+# 1. 基础模块定义 (Bottleneck for ResNet50, BasicBlock for ResNet18)
+# =======================================================================
 
 class Bottleneck(nn.Module):
     expansion = 4
@@ -27,11 +28,11 @@ class Bottleneck(nn.Module):
         self.conv1 = nn.Conv2d(in_channels=in_channel, out_channels=out_channel,
                                kernel_size=1, stride=1, bias=False)  # squeeze channels
         self.bn1 = norm_layer(out_channel)
-        # -----------------------------------------
+        
         self.conv2 = nn.Conv2d(in_channels=out_channel, out_channels=out_channel,
                                kernel_size=3, stride=stride, bias=False, padding=1)
         self.bn2 = norm_layer(out_channel)
-        # -----------------------------------------
+        
         self.conv3 = nn.Conv2d(in_channels=out_channel, out_channels=out_channel * self.expansion,
                                kernel_size=1, stride=1, bias=False)  # unsqueeze channels
         self.bn3 = norm_layer(out_channel * self.expansion)
@@ -56,12 +57,45 @@ class Bottleneck(nn.Module):
 
         out += identity
         out = self.relu(out)
-
         return out
 
+class BasicBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, in_channel, out_channel, stride=1, downsample=None, norm_layer=None):
+        super().__init__()
+        if norm_layer is None:
+            norm_layer = nn.BatchNorm2d
+        self.conv1 = nn.Conv2d(in_channel, out_channel, kernel_size=3, stride=stride,
+                               padding=1, bias=False)
+        self.bn1 = norm_layer(out_channel)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(out_channel, out_channel, kernel_size=3, stride=1,
+                               padding=1, bias=False)
+        self.bn2 = norm_layer(out_channel)
+        self.downsample = downsample
+
+    def forward(self, x):
+        identity = x
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        out += identity
+        out = self.relu(out)
+        return out
+
+# =======================================================================
+# 2. ResNet 主体结构
+# =======================================================================
 
 class ResNet(nn.Module):
-
     def __init__(self, block, blocks_num, num_classes=1000, include_top=True, norm_layer=None):
         super().__init__()
         if norm_layer is None:
@@ -76,12 +110,14 @@ class ResNet(nn.Module):
         self.bn1 = norm_layer(self.in_channel)
         self.relu = nn.ReLU(inplace=True)
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        
         self.layer1 = self._make_layer(block, 64, blocks_num[0])
         self.layer2 = self._make_layer(block, 128, blocks_num[1], stride=2)
         self.layer3 = self._make_layer(block, 256, blocks_num[2], stride=2)
         self.layer4 = self._make_layer(block, 512, blocks_num[3], stride=2)
+        
         if self.include_top:
-            self.avgpool = nn.AdaptiveAvgPool2d((1, 1))  # output size = (1, 1)
+            self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
             self.fc = nn.Linear(512 * block.expansion, num_classes)
 
         for m in self.modules():
@@ -121,27 +157,16 @@ class ResNet(nn.Module):
             x = self.avgpool(x)
             x = torch.flatten(x, 1)
             x = self.fc(x)
-
         return x
 
-
 def overwrite_eps(model, eps):
-    """
-    This method overwrites the default eps values of all the
-    FrozenBatchNorm2d layers of the model with the provided value.
-    This is necessary to address the BC-breaking change introduced
-    by the bug-fix at pytorch/vision#2933. The overwrite is applied
-    only when the pretrained weights are loaded to maintain compatibility
-    with previous versions.
-
-    Args:
-        model (nn.Module): The model on which we perform the overwrite.
-        eps (float): The new value of eps.
-    """
     for module in model.modules():
         if isinstance(module, FrozenBatchNorm2d):
             module.eps = eps
 
+# =======================================================================
+# 3. 对外接口: ResNet50 和 ResNet18
+# =======================================================================
 
 def resnet50_fpn_backbone(pretrain_path="",
                           norm_layer=nn.BatchNorm2d,
@@ -149,18 +174,7 @@ def resnet50_fpn_backbone(pretrain_path="",
                           returned_layers=None,
                           extra_blocks=None):
     """
-    搭建resnet50_fpn——backbone
-    Args:
-        pretrain_path: resnet50的预训练权重，如果不使用就默认为空
-        norm_layer: 默认是nn.BatchNorm2d，如果GPU显存很小，batch_size不能设置很大，
-                    建议将norm_layer设置成FrozenBatchNorm2d(默认是nn.BatchNorm2d)
-                    (https://github.com/facebookresearch/maskrcnn-benchmark/issues/267)
-        trainable_layers: 指定训练哪些层结构
-        returned_layers: 指定哪些层的输出需要返回
-        extra_blocks: 在输出的特征层基础上额外添加的层结构
-
-    Returns:
-
+    搭建 resnet50_fpn_backbone
     """
     resnet_backbone = ResNet(Bottleneck, [3, 4, 6, 3],
                              include_top=False,
@@ -170,21 +184,19 @@ def resnet50_fpn_backbone(pretrain_path="",
         overwrite_eps(resnet_backbone, 0.0)
 
     if pretrain_path != "":
-        assert os.path.exists(pretrain_path), "{} is not exist.".format(pretrain_path)
-        # 载入预训练权重
-        print(resnet_backbone.load_state_dict(torch.load(pretrain_path), strict=False))
+        if os.path.exists(pretrain_path):
+            print(f"Loading ResNet50 weights from {pretrain_path}")
+            print(resnet_backbone.load_state_dict(torch.load(pretrain_path), strict=False))
+        else:
+            print(f"[Warning] ResNet50 path {pretrain_path} does not exist. Using random init.")
 
-    # select layers that wont be frozen
+    # 冻结层逻辑
     assert 0 <= trainable_layers <= 5
     layers_to_train = ['layer4', 'layer3', 'layer2', 'layer1', 'conv1'][:trainable_layers]
-
-    # 如果要训练所有层结构的话，不要忘了conv1后还有一个bn1
     if trainable_layers == 5:
         layers_to_train.append("bn1")
 
-    # freeze layers
     for name, parameter in resnet_backbone.named_parameters():
-        # 只训练不在layers_to_train列表中的层结构
         if all([not name.startswith(layer) for layer in layers_to_train]):
             parameter.requires_grad_(False)
 
@@ -193,16 +205,62 @@ def resnet50_fpn_backbone(pretrain_path="",
 
     if returned_layers is None:
         returned_layers = [1, 2, 3, 4]
-    # 返回的特征层个数肯定大于0小于5
     assert min(returned_layers) > 0 and max(returned_layers) < 5
 
-    # return_layers = {'layer1': '0', 'layer2': '1', 'layer3': '2', 'layer4': '3'}
     return_layers = {f'layer{k}': str(v) for v, k in enumerate(returned_layers)}
 
-    # in_channel 为layer4的输出特征矩阵channel = 2048
-    in_channels_stage2 = resnet_backbone.in_channel // 8  # 256
-    # 记录resnet50提供给fpn的每个特征层channel
+    in_channels_stage2 = resnet_backbone.in_channel // 8  # 2048 // 8 = 256
     in_channels_list = [in_channels_stage2 * 2 ** (i - 1) for i in returned_layers]
-    # 通过fpn后得到的每个特征层的channel
     out_channels = 256
+    
+    return BackboneWithFPN(resnet_backbone, return_layers, in_channels_list, out_channels, extra_blocks=extra_blocks)
+
+
+def resnet18_fpn_backbone(pretrain_path="",
+                          norm_layer=nn.BatchNorm2d,
+                          trainable_layers=3,
+                          returned_layers=None,
+                          extra_blocks=None):
+    """
+    搭建 resnet18_fpn_backbone (新增)
+    """
+    # ResNet18 使用 BasicBlock, 层数配置为 [2, 2, 2, 2]
+    resnet_backbone = ResNet(BasicBlock, [2, 2, 2, 2],
+                             include_top=False,
+                             norm_layer=norm_layer)
+
+    if isinstance(norm_layer, FrozenBatchNorm2d):
+        overwrite_eps(resnet_backbone, 0.0)
+
+    if pretrain_path != "":
+        if os.path.exists(pretrain_path):
+            print(f"Loading ResNet18 weights from {pretrain_path}")
+            print(resnet_backbone.load_state_dict(torch.load(pretrain_path), strict=False))
+        else:
+            print(f"[Warning] ResNet18 path {pretrain_path} does not exist. Using random init.")
+
+    # 冻结层逻辑
+    assert 0 <= trainable_layers <= 5
+    layers_to_train = ['layer4', 'layer3', 'layer2', 'layer1', 'conv1'][:trainable_layers]
+    if trainable_layers == 5:
+        layers_to_train.append("bn1")
+
+    for name, parameter in resnet_backbone.named_parameters():
+        if all([not name.startswith(layer) for layer in layers_to_train]):
+            parameter.requires_grad_(False)
+
+    if extra_blocks is None:
+        extra_blocks = LastLevelMaxPool()
+
+    if returned_layers is None:
+        returned_layers = [1, 2, 3, 4]
+    assert min(returned_layers) > 0 and max(returned_layers) < 5
+
+    return_layers = {f'layer{k}': str(v) for v, k in enumerate(returned_layers)}
+
+    # ResNet18 layer4输出512通道，stage2是64通道
+    in_channels_stage2 = 64 
+    in_channels_list = [in_channels_stage2 * 2 ** (i - 1) for i in returned_layers]
+    out_channels = 256
+    
     return BackboneWithFPN(resnet_backbone, return_layers, in_channels_list, out_channels, extra_blocks=extra_blocks)

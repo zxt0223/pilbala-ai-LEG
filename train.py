@@ -315,7 +315,7 @@ if __name__ == "__main__":
                         metavar='W', help='weight decay (default: 1e-4)',
                         dest='weight_decay')
     # 针对torch.optim.lr_scheduler.MultiStepLR的参数
-    parser.add_argument('--lr-steps', default=[25, 40], nargs='+', type=int,
+    parser.add_argument('--lr-steps', default=[30, 45], nargs='+', type=int,
                         help='decrease lr every step-size epochs')
     # 针对torch.optim.lr_scheduler.MultiStepLR的参数
     parser.add_argument('--lr-gamma', default=0.1, type=float, help='decrease lr by a factor of lr-gamma')
